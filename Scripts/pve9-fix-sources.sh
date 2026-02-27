@@ -2,26 +2,25 @@
 set -euo pipefail
 shopt -s nullglob
 
-LOG="/var/log/pve9-fix-sources-safe.log"
+LOG="/var/log/pve-fix-sources.log"
 
 ts(){ date +%Y%m%d-%H%M%S; }
 log(){ echo "[$(date -Is)] $*" | tee -a "$LOG"; }
 
-declare -A STEP_STATUS STEP_DETAIL
-ok(){ STEP_STATUS["$1"]="OK"; STEP_DETAIL["$1"]="${2:-}"; }
-warn(){ STEP_STATUS["$1"]="WARN"; STEP_DETAIL["$1"]="${2:-}"; }
-fail(){ STEP_STATUS["$1"]="FAIL"; STEP_DETAIL["$1"]="${2:-}"; }
+declare -A STS MSG
+ok(){ STS["$1"]="OK"; MSG["$1"]="${2:-}"; }
+warn(){ STS["$1"]="WARN"; MSG["$1"]="${2:-}"; }
+fail(){ STS["$1"]="FAIL"; MSG["$1"]="${2:-}"; }
 
-need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { log "ERROR: run as root"; exit 1; }; }
-need_cmd(){ command -v "$1" >/dev/null 2>&1 || { log "ERROR: missing command: $1"; exit 1; }; }
+need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { log "ERROR: Run as root"; exit 1; }; }
+need_pve(){ command -v pveversion >/dev/null 2>&1 || { log "ERROR: pveversion not found"; exit 1; }; }
 
 pve_ver(){
-  # pve-manager/9.1.1/...
   pveversion 2>/dev/null | awk -F'/' '{print $2}' | awk -F'-' '{print $1}'
 }
 
 detect_suite(){
-  # Prefer reading Suites from debian.sources (deb822)
+  # Prefer Debian suite from debian.sources if present
   local f="/etc/apt/sources.list.d/debian.sources"
   if [[ -f "$f" ]]; then
     local s
@@ -38,29 +37,26 @@ backup_file(){
   log "Backup: ${f}.bak.$(ts)"
 }
 
-disable_source_file(){
-  # Renames a .sources file to make APT ignore it (safe, no parsing issues)
+disable_file(){
+  # Disable a sources/list file by renaming it so APT ignores it
   local f="$1"
   [[ -f "$f" ]] || return 0
-  local new="${f}.disabled-$(ts)"
   backup_file "$f"
+  local new="${f}.disabled-$(ts)"
   mv -f "$f" "$new"
-  log "Disabled (renamed): $f -> $new"
+  log "Disabled: $f -> $new"
 }
 
 print_summary(){
   echo
   log "================= SUMMARY ================="
-  printf "\n%-26s %-6s %s\n" "STEP" "STATUS" "DETAILS" | tee -a "$LOG"
-  printf "%-26s %-6s %s\n" "----" "------" "-------" | tee -a "$LOG"
-
-  local steps=("validate_env" "disable_enterprise" "disable_ceph" "ensure_nosub" "apt_update")
-  for s in "${steps[@]}"; do
-    printf "%-26s %-6s %s\n" "$s" "${STEP_STATUS[$s]:-SKIP}" "${STEP_DETAIL[$s]:-}" | tee -a "$LOG"
+  printf "\n%-22s %-6s %s\n" "STEP" "STATUS" "DETAILS" | tee -a "$LOG"
+  printf "%-22s %-6s %s\n" "----" "------" "-------" | tee -a "$LOG"
+  for s in validate disable_enterprise disable_ceph ensure_nosub apt_update; do
+    printf "%-22s %-6s %s\n" "$s" "${STS[$s]:-SKIP}" "${MSG[$s]:-}" | tee -a "$LOG"
   done
-
   echo | tee -a "$LOG"
-  log "Log file: $LOG"
+  log "Log: $LOG"
 }
 
 trap 'print_summary' EXIT
@@ -70,54 +66,46 @@ main(){
   touch "$LOG" || true
 
   need_root
-  need_cmd pveversion
-  need_cmd apt-get
-  need_cmd grep
-  need_cmd awk
+  need_pve
 
   local ver major suite
   ver="$(pve_ver)"
   major="${ver%%.*}"
   suite="$(detect_suite)"
 
-  log "Detected Proxmox VE version: $ver (major=$major)"
-  log "Detected Debian suite: $suite"
+  log "Detected Proxmox VE version: $ver"
+  log "Detected suite: $suite"
+  log "Note: Proxmox 9 uses deb822 (*.sources). /etc/apt/sources.list may be empty (normal)."
 
   if [[ "$major" != "9" ]]; then
-    fail "validate_env" "This script is for Proxmox VE 9.x only (detected $ver)"
+    fail validate "This script is for Proxmox VE 9.x only (detected $ver)"
     exit 1
   fi
-  ok "validate_env" "Environment OK (PVE $ver / suite $suite)"
+  ok validate "PVE 9.x confirmed"
 
-  # --- Disable enterprise sources safely by renaming files ---
-  local ent_touched=0
-  for f in /etc/apt/sources.list.d/*.sources; do
-    if grep -qE 'enterprise\.proxmox\.com' "$f" || grep -qE '^\s*Components:\s*.*pve-enterprise' "$f"; then
-      disable_source_file "$f"
-      ent_touched=$((ent_touched+1))
+  # --- Disable enterprise sources by RENAMING (safe) ---
+  local ent=0
+  for f in /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+    [[ -f "$f" ]] || continue
+    if grep -qE 'enterprise\.proxmox\.com' "$f" || grep -qE 'pve-enterprise' "$f"; then
+      disable_file "$f"
+      ent=$((ent+1))
     fi
   done
-  if [[ $ent_touched -gt 0 ]]; then
-    ok "disable_enterprise" "Disabled $ent_touched enterprise source file(s)"
-  else
-    ok "disable_enterprise" "No enterprise sources found"
-  fi
+  ok disable_enterprise "Disabled $ent enterprise file(s) (renamed)"
 
-  # --- Disable ceph sources safely (optional but recommended if you won't use Ceph) ---
-  local ceph_touched=0
-  for f in /etc/apt/sources.list.d/*.sources; do
+  # --- Disable ceph sources by RENAMING (safe) ---
+  local ceph=0
+  for f in /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+    [[ -f "$f" ]] || continue
     if grep -qiE 'ceph' "$f"; then
-      disable_source_file "$f"
-      ceph_touched=$((ceph_touched+1))
+      disable_file "$f"
+      ceph=$((ceph+1))
     fi
   done
-  if [[ $ceph_touched -gt 0 ]]; then
-    ok "disable_ceph" "Disabled $ceph_touched ceph-related source file(s)"
-  else
-    ok "disable_ceph" "No ceph sources found"
-  fi
+  ok disable_ceph "Disabled $ceph ceph-related file(s) (renamed)"
 
-  # --- Ensure pve-no-subscription deb822 source exists and is enabled ---
+  # --- Ensure no-subscription repo exists (deb822) ---
   local nosub="/etc/apt/sources.list.d/pve-no-subscription.sources"
   backup_file "$nosub"
   cat >"$nosub" <<EOF
@@ -127,9 +115,9 @@ Suites: ${suite}
 Components: pve-no-subscription
 Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
 EOF
-  ok "ensure_nosub" "Wrote $nosub"
+  ok ensure_nosub "Wrote $nosub"
 
-  # --- Validate ---
+  # --- Validate apt ---
   log "Running apt-get update to validate sources..."
   set +e
   local out rc
@@ -139,10 +127,9 @@ EOF
   echo "$out" | tee -a "$LOG"
 
   if [[ $rc -eq 0 ]]; then
-    ok "apt_update" "apt-get update OK (sources valid)"
+    ok apt_update "apt-get update OK"
   else
-    # common errors: malformed stanza, 401 unauthorized, etc.
-    fail "apt_update" "apt-get update failed (see log). Fix remaining .sources/.list files."
+    fail apt_update "apt-get update failed (see log). You still have a broken .sources/.list active."
     exit 1
   fi
 
