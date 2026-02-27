@@ -2,17 +2,33 @@
 set -euo pipefail
 shopt -s nullglob
 
-LOG="/var/log/pve-fix-sources.log"
+LOG="/var/log/pve9-fix-sources-safe.log"
+
 ts(){ date +%Y%m%d-%H%M%S; }
 log(){ echo "[$(date -Is)] $*" | tee -a "$LOG"; }
-die(){ log "ERROR: $*"; exit 1; }
 
-need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Run as root"; }
-need_pve(){ command -v pveversion >/dev/null 2>&1 || die "pveversion not found (not Proxmox?)"; }
+declare -A STEP_STATUS STEP_DETAIL
+ok(){ STEP_STATUS["$1"]="OK"; STEP_DETAIL["$1"]="${2:-}"; }
+warn(){ STEP_STATUS["$1"]="WARN"; STEP_DETAIL["$1"]="${2:-}"; }
+fail(){ STEP_STATUS["$1"]="FAIL"; STEP_DETAIL["$1"]="${2:-}"; }
+
+need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { log "ERROR: run as root"; exit 1; }; }
+need_cmd(){ command -v "$1" >/dev/null 2>&1 || { log "ERROR: missing command: $1"; exit 1; }; }
 
 pve_ver(){
-  # pve-manager/9.1.6/...
-  pveversion | awk -F'/' '{print $2}' | awk -F'-' '{print $1}'
+  # pve-manager/9.1.1/...
+  pveversion 2>/dev/null | awk -F'/' '{print $2}' | awk -F'-' '{print $1}'
+}
+
+detect_suite(){
+  # Prefer reading Suites from debian.sources (deb822)
+  local f="/etc/apt/sources.list.d/debian.sources"
+  if [[ -f "$f" ]]; then
+    local s
+    s="$(grep -m1 -E '^\s*Suites:\s*' "$f" | awk '{print $2}' || true)"
+    [[ -n "${s:-}" ]] && { echo "$s"; return 0; }
+  fi
+  echo "trixie"
 }
 
 backup_file(){
@@ -22,74 +38,115 @@ backup_file(){
   log "Backup: ${f}.bak.$(ts)"
 }
 
-deb822_set_enabled(){
+disable_source_file(){
+  # Renames a .sources file to make APT ignore it (safe, no parsing issues)
   local f="$1"
-  local val="$2" # yes/no
   [[ -f "$f" ]] || return 0
+  local new="${f}.disabled-$(ts)"
   backup_file "$f"
-  if grep -qE '^Enabled:' "$f"; then
-    sed -i "s/^Enabled:.*/Enabled: ${val}/" "$f"
-  else
-    printf "\nEnabled: %s\n" "$val" >>"$f"
-  fi
+  mv -f "$f" "$new"
+  log "Disabled (renamed): $f -> $new"
 }
 
-main(){
-  need_root
-  need_pve
-  mkdir -p "$(dirname "$LOG")"; touch "$LOG" || true
+print_summary(){
+  echo
+  log "================= SUMMARY ================="
+  printf "\n%-26s %-6s %s\n" "STEP" "STATUS" "DETAILS" | tee -a "$LOG"
+  printf "%-26s %-6s %s\n" "----" "------" "-------" | tee -a "$LOG"
 
-  local ver major
+  local steps=("validate_env" "disable_enterprise" "disable_ceph" "ensure_nosub" "apt_update")
+  for s in "${steps[@]}"; do
+    printf "%-26s %-6s %s\n" "$s" "${STEP_STATUS[$s]:-SKIP}" "${STEP_DETAIL[$s]:-}" | tee -a "$LOG"
+  done
+
+  echo | tee -a "$LOG"
+  log "Log file: $LOG"
+}
+
+trap 'print_summary' EXIT
+
+main(){
+  mkdir -p "$(dirname "$LOG")" || true
+  touch "$LOG" || true
+
+  need_root
+  need_cmd pveversion
+  need_cmd apt-get
+  need_cmd grep
+  need_cmd awk
+
+  local ver major suite
   ver="$(pve_ver)"
   major="${ver%%.*}"
-  log "Detected Proxmox VE version: $ver"
+  suite="$(detect_suite)"
 
-  [[ "$major" == "9" ]] || die "This script is for Proxmox VE 9.x only (detected $ver)."
+  log "Detected Proxmox VE version: $ver (major=$major)"
+  log "Detected Debian suite: $suite"
 
-  log "APT format note: Proxmox 9 uses deb822 (*.sources). /etc/apt/sources.list may be empty (normal)."
+  if [[ "$major" != "9" ]]; then
+    fail "validate_env" "This script is for Proxmox VE 9.x only (detected $ver)"
+    exit 1
+  fi
+  ok "validate_env" "Environment OK (PVE $ver / suite $suite)"
 
-  # 1) Disable any enterprise repos (PVE/Ceph) via Enabled: no
-  log "Disabling enterprise repositories (if present)..."
-  local changed=0
+  # --- Disable enterprise sources safely by renaming files ---
+  local ent_touched=0
   for f in /etc/apt/sources.list.d/*.sources; do
-    if grep -qE 'enterprise\.proxmox\.com' "$f" || grep -qE '^Components:.*pve-enterprise' "$f"; then
-      deb822_set_enabled "$f" "no"
-      log "Disabled enterprise in: $f"
-      changed=$((changed+1))
+    if grep -qE 'enterprise\.proxmox\.com' "$f" || grep -qE '^\s*Components:\s*.*pve-enterprise' "$f"; then
+      disable_source_file "$f"
+      ent_touched=$((ent_touched+1))
     fi
   done
-  log "Enterprise disable pass done (touched $changed file(s))."
+  if [[ $ent_touched -gt 0 ]]; then
+    ok "disable_enterprise" "Disabled $ent_touched enterprise source file(s)"
+  else
+    ok "disable_enterprise" "No enterprise sources found"
+  fi
 
-  # 2) Ensure pve-no-subscription repo exists/enabled
-  local nosub="/etc/apt/sources.list.d/pve-no-subscription.sources"
-  log "Ensuring pve-no-subscription repo: $nosub"
-  backup_file "$nosub"
-  cat >"$nosub" <<'EOF'
-Types: deb
-URIs: http://download.proxmox.com/debian/pve
-Suites: trixie
-Components: pve-no-subscription
-Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
-Enabled: yes
-EOF
-  log "Wrote: $nosub"
-
-  # 3) Optional: disable Ceph sources entirely (common if you’re not using Ceph)
-  # If you want to keep Ceph, comment this block.
-  log "Disabling Ceph sources (safe if you are not using Ceph)..."
+  # --- Disable ceph sources safely (optional but recommended if you won't use Ceph) ---
+  local ceph_touched=0
   for f in /etc/apt/sources.list.d/*.sources; do
     if grep -qiE 'ceph' "$f"; then
-      deb822_set_enabled "$f" "no"
-      log "Disabled ceph in: $f"
+      disable_source_file "$f"
+      ceph_touched=$((ceph_touched+1))
     fi
   done
+  if [[ $ceph_touched -gt 0 ]]; then
+    ok "disable_ceph" "Disabled $ceph_touched ceph-related source file(s)"
+  else
+    ok "disable_ceph" "No ceph sources found"
+  fi
 
-  # 4) Validate with apt-get update
+  # --- Ensure pve-no-subscription deb822 source exists and is enabled ---
+  local nosub="/etc/apt/sources.list.d/pve-no-subscription.sources"
+  backup_file "$nosub"
+  cat >"$nosub" <<EOF
+Types: deb
+URIs: http://download.proxmox.com/debian/pve
+Suites: ${suite}
+Components: pve-no-subscription
+Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
+EOF
+  ok "ensure_nosub" "Wrote $nosub"
+
+  # --- Validate ---
   log "Running apt-get update to validate sources..."
-  apt-get update 2>&1 | tee -a "$LOG"
+  set +e
+  local out rc
+  out="$(apt-get update 2>&1)"
+  rc=$?
+  set -e
+  echo "$out" | tee -a "$LOG"
 
-  log "DONE. If apt-get update completed without 401, sources are correct."
-  log "Log: $LOG"
+  if [[ $rc -eq 0 ]]; then
+    ok "apt_update" "apt-get update OK (sources valid)"
+  else
+    # common errors: malformed stanza, 401 unauthorized, etc.
+    fail "apt_update" "apt-get update failed (see log). Fix remaining .sources/.list files."
+    exit 1
+  fi
+
+  log "DONE."
 }
 
 main "$@"
