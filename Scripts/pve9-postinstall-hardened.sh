@@ -5,7 +5,7 @@ shopt -s nullglob
 # ==========================================================
 # Proxmox VE 9.x Post-Install Hardened (no hook)
 # Focus: security, clean repos (deb822), optional nag removal
-# Robust: end summary ALWAYS (trap), no complex perl regex
+# Robust: end summary ALWAYS (trap), no complex regex
 # ==========================================================
 
 LOG_FILE="/var/log/pve-postinstall-hardened.log"
@@ -23,6 +23,7 @@ REBOOT_AFTER="${REBOOT_AFTER:-no}"                          # yes/no -> reboot a
 # ---------- Constants ----------
 PVE_NO_SUB_URI="http://download.proxmox.com/debian/pve"
 PVE_KEYRING="/usr/share/keyrings/proxmox-archive-keyring.gpg"
+PVE_SUITE="trixie"
 
 # ---------- Result bookkeeping ----------
 declare -A STEP_OK
@@ -40,8 +41,19 @@ log() {
   echo "[$(date -Is)] $msg" | tee -a "$LOG_FILE"
 }
 
-need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { log "ERROR: Run as root"; exit 1; }; }
-need_pve(){ command -v pveversion >/dev/null 2>&1 || { log "ERROR: pveversion not found"; exit 1; }; }
+need_root(){
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    log "ERROR: Run as root"
+    exit 1
+  fi
+}
+
+need_pve(){
+  if ! command -v pveversion >/dev/null 2>&1; then
+    log "ERROR: pveversion not found (not a Proxmox host?)"
+    exit 1
+  fi
+}
 
 backup_file() {
   local f="$1"
@@ -151,20 +163,17 @@ step_enable_no_subscription_repo() {
     return 0
   fi
 
-  local major ver
-  read -r major ver < <(detect_pve_version)
-  local suite="trixie"
-
   local f="/etc/apt/sources.list.d/pve-no-subscription.sources"
   log "Ensuring pve-no-subscription repo (deb822): $f"
   backup_file "$f"
   cat >"$f" <<EOF
 Types: deb
 URIs: ${PVE_NO_SUB_URI}
-Suites: ${suite}
+Suites: ${PVE_SUITE}
 Components: pve-no-subscription
 Signed-By: ${PVE_KEYRING}
 EOF
+
   mark_ok "$step" "Created/updated $f"
   return 0
 }
@@ -311,6 +320,10 @@ step_remove_subscription_nag() {
   local tmp
   tmp="$(mktemp)"
 
+  # NO complex regex with [] here. This avoids "Unmatched [" completely.
+  # Strategy:
+  # - Find first occurrence of "getNoSubKeyHtml"
+  # - Look backwards for nearest 'if (' and replace its condition with 'false'
   set +e
   perl -0777 -e '
     my $s = do { local $/; <STDIN> };
@@ -321,8 +334,7 @@ step_remove_subscription_nag() {
     my $pos = index($s, $k);
     if ($pos < 0) { print $s; exit 2; }
 
-    # Look back up to 3000 chars for nearest "if (" before getNoSubKeyHtml
-    my $start = $pos - 3000; $start = 0 if $start < 0;
+    my $start = $pos - 4000; $start = 0 if $start < 0;
     my $chunk = substr($s, $start, $pos - $start);
 
     my $ifpos = rindex($chunk, "if (");
@@ -330,16 +342,9 @@ step_remove_subscription_nag() {
 
     my $abs_if = $start + $ifpos;
 
-    # Find the next "{" after that if
-    my $brace = index($s, "{", $abs_if);
-    if ($brace < 0) { print $s; exit 4; }
-
-    # Replace the condition region with if (false)
-    # We replace from "if (" until just before "{"
-    my $before = substr($s, 0, $abs_if);
-    my $after  = substr($s, $brace); # includes "{"
-    $after =~ s/^/if (false) /;       # prepend
-    $s = $before . $after;
+    # Replace only the condition part: if ( ... )  -> if (false)
+    # This regex does NOT use [] character classes.
+    substr($s, $abs_if) =~ s/^if\s*\([^)]*\)/if (false)/s;
 
     $s .= "\n$marker\n";
     print $s;
@@ -353,18 +358,16 @@ step_remove_subscription_nag() {
     rm -f "$tmp"
     if systemctl restart pveproxy; then
       mark_ok "$step" "Patched proxmoxlib.js + restarted pveproxy. Clear browser cache."
-      return 0
     else
-      mark_warn "$step" "Patched proxmoxlib.js but failed to restart pveproxy (restart manually)."
-      return 0
+      mark_warn "$step" "Patched proxmoxlib.js but pveproxy restart failed (restart manually)."
     fi
+    return 0
   fi
 
   rm -f "$tmp"
   case "$prc" in
-    2) mark_warn "$step" "Pattern not found (getNoSubKeyHtml missing). No change." ;;
-    3) mark_warn "$step" "Could not find nearest 'if (' before nag. No change." ;;
-    4) mark_warn "$step" "Could not find '{' after if. No change." ;;
+    2) mark_warn "$step" "getNoSubKeyHtml not found. No change." ;;
+    3) mark_warn "$step" "Nearest 'if (' not found. No change." ;;
     *) mark_fail "$step" "Nag patch failed (perl exit $prc). No change." ;;
   esac
   return 0
