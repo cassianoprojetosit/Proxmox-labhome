@@ -26,8 +26,30 @@ ERR_STEP="validate"
 need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { fail validate "Run as root"; exit 1; }; }
 need_cmd(){ command -v "$1" >/dev/null 2>&1 || { fail validate "Missing command: $1"; exit 1; }; }
 
+# Robust: no awk/pipefail dependency.
+# Returns version like: 9.1.6
 pve_ver(){
-  pveversion 2>/dev/null | awk -F'/' '{print $2}' | awk -F'-' '{print $1}'
+  local raw ver
+  raw="$(pveversion 2>/dev/null || true)"
+  [[ -n "${raw:-}" ]] || { echo ""; return 1; }
+
+  # Find token starting with "pve-manager/"
+  # Example: "pve-manager/9.1.6/..."
+  local token=""
+  for t in $raw; do
+    case "$t" in
+      pve-manager/*) token="$t"; break ;;
+    esac
+  done
+  [[ -n "$token" ]] || return 2
+
+  # token="pve-manager/9.1.6/xxx"
+  ver="${token#pve-manager/}"
+  ver="${ver%%/*}"     # 9.1.6
+  ver="${ver%%-*}"     # in case of "-something"
+  [[ -n "$ver" ]] || return 3
+  printf '%s\n' "$ver"
+  return 0
 }
 
 detect_suite(){
@@ -56,7 +78,6 @@ disable_by_rename(){
 }
 
 print_report(){
-  # If main never started, report it clearly
   if [[ "$MAIN_STARTED" -ne 1 ]]; then
     fail validate "main() did not start. File not overwritten correctly or parse/line-ending issue."
   fi
@@ -96,7 +117,6 @@ main(){
   need_root
   need_cmd pveversion
   need_cmd apt-get
-  need_cmd awk
   need_cmd grep
   need_cmd mv
   need_cmd cp
@@ -104,7 +124,13 @@ main(){
   need_cmd tee
 
   local ver major suite
-  ver="$(pve_ver)"
+  if ! ver="$(pve_ver)"; then
+    local raw
+    raw="$(pveversion 2>&1 || true)"
+    fail validate "Could not parse pveversion. Raw: ${raw}"
+    exit 1
+  fi
+
   major="${ver%%.*}"
   suite="$(detect_suite)"
 
@@ -115,7 +141,7 @@ main(){
     fail validate "This script supports Proxmox VE 9.x only (detected $ver)"
     exit 1
   fi
-  ok validate "PVE 9.x confirmed"
+  ok validate "PVE 9.x confirmed (ver=$ver, suite=$suite)"
 
   ERR_STEP="backup"
   backup_file "$NOSUB_SOURCES"
